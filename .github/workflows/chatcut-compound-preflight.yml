@@ -1,0 +1,109 @@
+name: ChatCut compound fork-only preflight
+
+on:
+  push:
+    branches: [validate-chatcut-compound-20261105]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-26, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    env:
+      HOMEBREW_NO_INSTALL_FROM_API: "1"
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_GITHUB_API_TOKEN: ${{ github.token }}
+    steps:
+      - uses: Homebrew/actions/setup-homebrew@d482da0e602890d3160aade42e72c8556103bf04
+        with:
+          core: false
+          cask: true
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          sparse-checkout: Casks/c/chatcut.rb
+          sparse-checkout-cone-mode: false
+      - name: Restore local-file installs after setup
+        run: echo 'HOMEBREW_NO_INSTALL_FROM_API=1' >> "$GITHUB_ENV"
+      - name: Use exact candidate in official tap namespace
+        id: candidate
+        run: |
+          cp Casks/c/chatcut.rb "$(brew --repository Homebrew/cask)/Casks/c/chatcut.rb"
+          brew config
+          shasum -a 256 Casks/c/chatcut.rb
+          brew ruby -e '
+            require "cask/cask_loader"
+            require "livecheck/livecheck_version"
+            cask = Cask::CaskLoader.load("homebrew/cask/chatcut")
+            raise "Wrong tap: #{cask.tap.name}" unless cask.tap.name == "homebrew/cask"
+            raise "Wrong compound version" unless cask.version.to_s == "0.9.3,41848233907-1"
+            raise "Wrong bundle version component" unless cask.version.csv.first == "0.9.3"
+            lc = ->(s) { Homebrew::Livecheck::LivecheckVersion.new(s.split(",").map { |part| Version.new(part) }) }
+            current = lc.call(cask.version.to_s)
+            ["0.9.3,41848233907-2", "0.9.3,41848233908-1", "0.9.4,42000000000-1"].each do |v|
+              raise "Bad compound ordering: #{v}" unless lc.call(v) > current
+            end
+            puts "Official-tap identity, compound version and future build/app ordering verified"
+          '
+      - name: Style (read-only)
+        id: style
+        continue-on-error: true
+        run: brew style --cask homebrew/cask/chatcut
+      - name: New-cask online audit (official tap context)
+        id: audit
+        continue-on-error: true
+        run: brew audit --new --online --cask homebrew/cask/chatcut
+      - name: Architecture-filtered livecheck
+        id: livecheck
+        continue-on-error: true
+        run: brew livecheck --cask homebrew/cask/chatcut
+      - name: Install with normal quarantine
+        id: install
+        continue-on-error: true
+        run: brew install --cask homebrew/cask/chatcut
+      - name: Verify native signature, Gatekeeper and bundle identity
+        id: native
+        if: steps.install.outcome == 'success'
+        continue-on-error: true
+        run: |
+          codesign --verify --deep --strict /Applications/ChatCut.app
+          codesign -dv --verbose=4 /Applications/ChatCut.app 2>&1 | grep 'TeamIdentifier=7WK2VURFPK'
+          spctl --assess --type execute --verbose=4 /Applications/ChatCut.app
+          test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' /Applications/ChatCut.app/Contents/Info.plist)" = io.chatcut.desktop
+          expected=$(brew ruby -e 'require "cask/cask_loader"; puts Cask::CaskLoader.load("homebrew/cask/chatcut").version.csv.first')
+          test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' /Applications/ChatCut.app/Contents/Info.plist)" = "$expected"
+          actual_arch=$(lipo -archs /Applications/ChatCut.app/Contents/MacOS/ChatCut)
+          test "$actual_arch" = "$(uname -m)"
+          xattr -p com.apple.quarantine /Applications/ChatCut.app
+      - name: Uninstall and preserve project data through opt-in zap
+        id: uninstall
+        if: always() && steps.install.outcome == 'success'
+        continue-on-error: true
+        run: |
+          mkdir -p "$HOME/Library/Application Support/ChatCut"
+          printf 'fork-only preservation fixture\n' > "$HOME/Library/Application Support/ChatCut/homebrew-preservation-check.txt"
+          brew uninstall --cask homebrew/cask/chatcut
+          brew uninstall --cask --force --zap homebrew/cask/chatcut
+          test -f "$HOME/Library/Application Support/ChatCut/homebrew-preservation-check.txt"
+          test ! -e /Applications/ChatCut.app
+      - name: Require all checks (no masked failures)
+        if: always()
+        env:
+          CANDIDATE: ${{ steps.candidate.outcome }}
+          STYLE: ${{ steps.style.outcome }}
+          AUDIT: ${{ steps.audit.outcome }}
+          LIVECHECK: ${{ steps.livecheck.outcome }}
+          INSTALL: ${{ steps.install.outcome }}
+          NATIVE: ${{ steps.native.outcome }}
+          UNINSTALL: ${{ steps.uninstall.outcome }}
+        run: |
+          for outcome in "$CANDIDATE" "$STYLE" "$AUDIT" "$LIVECHECK" "$INSTALL" "$NATIVE" "$UNINSTALL"; do
+            test "$outcome" = success || exit 1
+          done
