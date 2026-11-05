@@ -1,0 +1,89 @@
+name: ChatCut fork-only preflight
+
+on:
+  push:
+    branches: [validate-chatcut-0.9.3-20261105]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    env:
+      HOMEBREW_NO_INSTALL_FROM_API: "1"
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_GITHUB_API_TOKEN: ${{ github.token }}
+    steps:
+      - uses: Homebrew/actions/setup-homebrew@d482da0e602890d3160aade42e72c8556103bf04
+        with:
+          core: false
+          cask: true
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          sparse-checkout: Casks/c/chatcut.rb
+          sparse-checkout-cone-mode: false
+      - name: Use exact candidate as Homebrew cask (not vendor tap)
+        run: |
+          cp Casks/c/chatcut.rb "$(brew --repository Homebrew/cask)/Casks/c/chatcut.rb"
+          brew config
+          shasum -a 256 Casks/c/chatcut.rb
+      - name: Style (read-only)
+        id: style
+        continue-on-error: true
+        run: brew style --cask chatcut
+      - name: New-cask online audit
+        id: audit
+        continue-on-error: true
+        run: brew audit --new --online --cask chatcut
+      - name: Livecheck
+        id: livecheck
+        continue-on-error: true
+        run: brew livecheck --cask chatcut
+      - name: Install with normal quarantine
+        id: install
+        continue-on-error: true
+        run: brew install --cask chatcut
+      - name: Verify native signature, Gatekeeper and bundle identity
+        id: native
+        if: steps.install.outcome == 'success'
+        continue-on-error: true
+        run: |
+          codesign --verify --deep --strict /Applications/ChatCut.app
+          codesign -dv --verbose=4 /Applications/ChatCut.app 2>&1 | grep 'TeamIdentifier=7WK2VURFPK'
+          spctl --assess --type execute --verbose=4 /Applications/ChatCut.app
+          test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' /Applications/ChatCut.app/Contents/Info.plist)" = io.chatcut.desktop
+          test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' /Applications/ChatCut.app/Contents/Info.plist)" = 0.9.3
+          lipo -archs /Applications/ChatCut.app/Contents/MacOS/ChatCut
+          xattr -p com.apple.quarantine /Applications/ChatCut.app
+      - name: Uninstall and check data preservation through opt-in zap
+        id: uninstall
+        if: always() && steps.install.outcome == 'success'
+        continue-on-error: true
+        run: |
+          mkdir -p "$HOME/Library/Application Support/ChatCut"
+          printf 'fork-only preservation fixture\n' > "$HOME/Library/Application Support/ChatCut/homebrew-preservation-check.txt"
+          brew uninstall --cask chatcut
+          brew uninstall --cask --force --zap chatcut
+          test -f "$HOME/Library/Application Support/ChatCut/homebrew-preservation-check.txt"
+          test ! -e /Applications/ChatCut.app
+      - name: Require all checks (no masked failures)
+        if: always()
+        env:
+          STYLE: ${{ steps.style.outcome }}
+          AUDIT: ${{ steps.audit.outcome }}
+          LIVECHECK: ${{ steps.livecheck.outcome }}
+          INSTALL: ${{ steps.install.outcome }}
+          NATIVE: ${{ steps.native.outcome }}
+          UNINSTALL: ${{ steps.uninstall.outcome }}
+        run: |
+          for outcome in "$STYLE" "$AUDIT" "$LIVECHECK" "$INSTALL" "$NATIVE" "$UNINSTALL"; do
+            test "$outcome" = success || exit 1
+          done
